@@ -2926,10 +2926,19 @@ struct Model::Impl {
             split128(g.ff, nm, 0, ff0_, FF);   // (the widest member's share: member 0 takes the odd blocks)
             const size_t C = (size_t) chunk;
             c.C = chunk;
-            c.A = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);
+            // DS4_ATTN_SLAB_MB (8): the attention slab's q in MB.  The chunk's attention weights (wq_b, wo_a, wo_b)
+            // are rebuilt to FP16 once per slab, so a wider slab pays that fewer times a prompt: Project Maya sized
+            // them from the card (within 3% of its memory) and measured 8K prompts +16% at 32 MB on a 32 GB card.
+            const int slab_mb = std::getenv("DS4_ATTN_SLAB_MB") ? std::max(1, std::atoi(std::getenv("DS4_ATTN_SLAB_MB"))) : 8;
+            c.A = std::max(64, (int) (((size_t) slab_mb << 20) / (size_t) HQ) / 64 * 64);
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
-            c.w16_elems = (size_t) 8 << 20;
+            // DS4_W16_MB (16 MB of FP16 = 8 Mi values): the dense weights' scratch, the 128-column blocks gemm() takes
+            const int w16_mb = std::getenv("DS4_W16_MB") ? std::max(1, std::atoi(std::getenv("DS4_W16_MB"))) : 16;
+            c.w16_elems = (size_t) w16_mb << 19;
+            if (std::getenv("DS4_ATTN_SLAB_MB") || std::getenv("DS4_W16_MB"))
+                std::fprintf(stderr, "ds4: CUDA%d prompt slabs: the attention %d rows (%d MB), the dense weights' FP16 scratch %d MB\n",
+                             d.id, c.A, slab_mb, w16_mb);
             bool has_eg = false, has_first = false;
             size_t stride = 0;
             for (const Layer& l : L)
