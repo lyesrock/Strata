@@ -22,6 +22,8 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
+#include "ds4_pcie.cuh"
+#include "ds4_pcie.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
@@ -674,6 +676,16 @@ struct Layer {
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
     bool swap_pending = false;
     unsigned long long* tab_pin = nullptr;      // pinned: the table entries a swap writes
+    // the recent slots (DS4_RECENT, with DS4_GS): rc_n VRAM slots from rc_base, each a copy of a CPU-lane expert the
+    // layer used lately - its RAM parts stay where they are, so one goes out by its table entry alone; least recently
+    // used out.  A streamed expert can land in one (its bytes cross PCIe once, not once a token).
+    int rc_base = -1, rc_n = 0;
+    std::vector<int> rc_exp, rc_fill, rc_land;  // a slot's expert (-1: none), the expert its copy is bringing, the one landing this window
+    std::vector<unsigned> rc_lseq;              // (a landing) its pull's seq
+    std::vector<int> rc_lq;                     // (a landing) its pick in that pull
+    std::deque<std::vector<int>> rc_hist;       // the CPU-lane experts of the layer's last ticks (a fill's rule)
+    std::vector<unsigned> rc_stamp;             // the tick that last used it
+    unsigned long long* rc_pin = nullptr;       // pinned: the slot's device address
     // a speculative window's backups (trunk layers): the ring rows it replaced, and a compressor's state before it and
     // the window's raw rows (kv, then score) to replay the accepted ones
     uint8_t* ring_bak = nullptr;
@@ -1009,6 +1021,7 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        int rc_slot = -1;   // (recent slots) a fill: `in` is copied into the layer's recent slot rc_slot, nothing moves out
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1252,6 +1265,7 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        ln_pool.reset();   // the PCIe lane's readers: after the lane that fed them
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
@@ -2678,6 +2692,8 @@ struct Model::Impl {
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
             c_yd.resize(S * E);
         }
+        // the decode PCIe lane's staging slots (DS4_GS), before the experts: its VRAM experts take what they leave
+        if (!lane_alloc(err)) return false;
         // the experts: VRAM slots in what each device has left, the rest on the host
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
@@ -2785,6 +2801,8 @@ struct Model::Impl {
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
+            // the decode PCIe lane's readers and its layer map (off unless DS4_GS=1 gave slots to a device)
+            lane_setup_gpus();
             const int core = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
             service = std::thread([this, core] {
                 if (core >= 0) pin_self(core);
@@ -3995,8 +4013,11 @@ struct Model::Impl {
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
             l.n_slots = std::min(l.n_vram, l.n_exp);
             if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
-                l.n_vram = l.n_slots - 1;
+                const int r = recent_n > 0 && lane_layer_ok(l) && l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
+                l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), out of the profile's coldest)
                 l.spare_vram = l.n_slots - 1;
+                l.rc_base = l.n_vram;
+                l.rc_n = r;
             } else {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
@@ -4078,6 +4099,20 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] >= 0) set_vm(l, e, l.slot[(size_t) e]);
             if (!halloc(l.tab_pin, (size_t) 2 * l.nm, err)) return false;
+            if (l.rc_n > 0) {
+                l.rc_exp.assign((size_t) l.rc_n, -1);
+                l.rc_fill.assign((size_t) l.rc_n, -1);
+                l.rc_land.assign((size_t) l.rc_n, -1);
+                l.rc_lseq.assign((size_t) l.rc_n, 0u);
+                l.rc_lq.assign((size_t) l.rc_n, 0);
+                l.rc_stamp.assign((size_t) l.rc_n, 0u);
+                if (!halloc(l.rc_pin, (size_t) l.nm + 1, err)) return false;
+                for (int i = 0; i < l.rc_n; ++i) {
+                    Layer& x = member(l, 0);
+                    l.rc_pin[(size_t) i] = (unsigned long long) (x.vram_base + (size_t) (l.rc_base + i) * unit(x));
+                }
+                l.rc_pin[(size_t) l.nm] = 0ull;   // (kept for the tab writer's shape; unused with nm 1)
+            }
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
@@ -6048,6 +6083,21 @@ struct Model::Impl {
                 sw_queue.pop_front();
             }
             Layer& l = L[(size_t) sw.layer];
+            if (sw.rc_slot >= 0 && sw.rc_slot < l.rc_n) {   // (a recent-slot fill: the blob in, nothing out; rc_look maps it)
+                Layer& x = member(l, 0);
+                cudaSetDevice(devs[(size_t) x.dev].id);
+                std::string ferr;
+                const bool ok = stream_expert(l, 0, sw.in, x.vram_base + (size_t) (l.rc_base + sw.rc_slot) * unit(x),
+                                              B.st[(size_t) x.dev], ferr) &&
+                                cudaStreamSynchronize(B.st[(size_t) x.dev]) == cudaSuccess;
+                if (!ok) {
+                    for (int i = 0; i < l.rc_n; ++i)
+                        if (l.rc_fill[(size_t) i] == sw.in) l.rc_fill[(size_t) i] = -1;
+                }
+                std::lock_guard<std::mutex> lk(sw_mu);
+                rc_ready.push_back({l.il, ok ? sw.rc_slot : -1, sw.in});
+                continue;
+            }
             if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file; out: nothing to keep (the file has it)
                 swap_in_mx(l, sw, B);
                 std::lock_guard<std::mutex> lk(sw_mu);
@@ -6226,7 +6276,9 @@ struct Model::Impl {
                          now_ms() - t0);
     }
     void cache_tick(int T) {
+        rc_hist_tick();   // (before the scan empties cpu_hits): the window the recent fills read
         cache_tick_swaps(T);
+        rc_look(T);
         store_sync();
         store_watch();
     }
@@ -6337,8 +6389,10 @@ struct Model::Impl {
                 if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
-                for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] >= 0 && (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
+                for (int e = 0; e < l.n_exp; ++e)   // (the recent slots leave their experts to the recent rule alone)
+                    if (l.slot[(size_t) e] >= 0 && (l.rc_n <= 0 || l.slot[(size_t) e] < l.rc_base ||
+                        l.slot[(size_t) e] >= l.rc_base + l.rc_n) &&
+                        (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
                 if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
                     l.swap_pending = true;
                     ++sw_inflight;
@@ -6446,6 +6500,411 @@ struct Model::Impl {
         pf_cv.notify_one();
     }
 
+    // ---- the decode path's PCIe lane (ds4_pcie.hpp; DS4_GS=1, off by default).  A decoded token's routed experts
+    // that VRAM does not hold were all computed by the CPU lane.  The lane reads some of them into pinned memory and
+    // the GPU pulls them into its staging slots itself (pcie::stream_fetch, enqueued with the layer: the host only
+    // reads and writes flags, never calls the GPU's API while the device waits on it - a thread that enqueues the
+    // layers can be blocked in the driver until the device moves on, and with it every other thread's call).  The
+    // fetch kernel writes the streamed picks' addresses into the plan itself (plan2 for the second gate / up, plan
+    // for the down), so their down runs with the VRAM ones'; a pick whose read failed keeps its plan entry 0: the
+    // token goes without it (logged once).
+    struct LaneDev {
+        bool on = false;          // some of its layers stream: their decode requests take the stream wait
+        uint8_t* vram = nullptr;  // `slots` staging slots of `stride` bytes (a request's streamed pick i in slot i)
+        size_t stride = 0;
+        int slots = 0;
+        int blocks = 1;           // the fetch kernel's grid (a block a multiprocessor)
+        unsigned long long* plan2 = nullptr;   // device [kPicks]: the streamed picks' plan (the second gate / up)
+        unsigned* dflag = nullptr;             // device: the fetch kernel's flags
+        uint8_t* host_dev = nullptr;           // ln_host as this device addresses it, its slots ln_stride apart
+        size_t hstride = 0;
+    };
+    // a request's reads (one batch at a time: the service thread's)
+    struct LaneJob {
+        int n = 0;
+        const Layer* l = nullptr;
+        pcie::Pull* pull = nullptr;
+        unsigned seq = 0;
+        int slot[pcie::kSlots] = {}, e[pcie::kSlots] = {};
+        std::atomic<int> left{0};
+        std::atomic<unsigned> bad{0};
+    } ln_job;
+    std::vector<LaneDev> ln_dev;
+    std::vector<int> ln_layer;               // layer -> its stream class (0: it streams; -1: the CPU lane alone)
+    uint8_t* ln_host = nullptr;              // pinned, mapped: kPicks slots of ln_stride (where the reads land)
+    size_t ln_stride = 0;
+    pcie::Pull* ln_pull = nullptr;           // host-mapped [kRing]: a decode request's pull (by its seq)
+    unsigned ln_mask_of[kRing] = {};         // a published pull's streamed-pick mask (the host's, for the enqueue thread)
+    std::unique_ptr<Pool> ln_pool;           // the reading threads (a streamed expert a job)
+    std::function<void(int)> ln_fn;
+    std::atomic<bool> ln_no_done{false};     // a pull's end not seen in time once: not waited for again
+    bool lane_on = false;
+    int recent_n = 0;                       // (DS4_RECENT, with DS4_GS) recent slots every lane layer keeps free
+    std::atomic<unsigned> rc_clock{1};      // stamps the recent slots for the least-recently-used choice
+    int rc_inflight = 0;                    // fills the cache threads are copying (the host's count)
+    struct RcDone { int layer = 0, slot = -1, expert = -1; };
+    std::vector<RcDone> rc_ready;           // fills copied, waiting for the next tick's map (guarded by sw_mu)
+    static constexpr int kRcFills = 2, kRcNeed = 2, kRcWin = 8;   // fills a layer starts a tick; a pick's uses in the window
+    static bool lane_gs_on() {
+        const char* v = std::getenv("DS4_GS");
+        return v != nullptr && std::atoi(v) != 0;
+    }
+    int lane_class(int li) const {
+        return lane_on && li >= 0 && li < (int) ln_layer.size() ? ln_layer[(size_t) li] : -1;
+    }
+    // a layer the PCIe lane can serve: a trunk layer of one GPU, a GGUF's experts, whose decode picks fit the slots
+    static bool lane_layer_ok(const Layer& l) {
+        return !l.mtp && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && l.k_exp > 0 && l.k_exp <= kPicks && l.blob > 0;
+    }
+    // the staging slots on each GPU whose layers may stream, before place_experts - its VRAM experts take what they
+    // leave: a request's picks, k_exp slots of the largest blob.  Not where every expert of its layers fits in VRAM.
+    bool lane_alloc(std::string& err) {
+        if (!pk.gguf || !lane_gs_on() || !moe_token_path || sync_decode) return true;
+        recent_n = std::max(0, (int) (std::getenv("DS4_RECENT") != nullptr ? std::atoi(std::getenv("DS4_RECENT")) : 8));
+        ln_dev.assign(devs.size(), LaneDev{});
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            LaneDev& D = ln_dev[di];
+            size_t stride = 0;
+            double exp_b = 0;
+            for (const Layer& l : L)
+                if (lane_layer_ok(l) && l.dev == (int) di) {
+                    stride = std::max(stride, align256(l.blob));
+                    D.slots = std::max(D.slots, l.k_exp);
+                    exp_b += (double) l.blob * l.n_exp;
+                }
+            if (stride == 0) continue;
+            CK(cudaSetDevice(d.id));
+            size_t fr = 0, tot = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            const double room = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+            if (exp_b <= room) continue;   // (every expert of its layers fits: the CPU lane has no picks to lose)
+            void* v = nullptr;
+            if (cudaMalloc(&v, (size_t) D.slots * stride) != cudaSuccess) {   // (none: this GPU's CPU lane alone)
+                cudaGetLastError();
+                continue;
+            }
+            d.allocs.push_back(v);
+            D.vram = (uint8_t*) v;
+            D.stride = stride;
+            ln_stride = std::max(ln_stride, stride);
+            if (!dalloc(d, D.plan2, kPicks, err) || !dalloc(d, D.dflag, pcie::kPullFlags, err)) return false;
+            int sms = 0;
+            if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d.id) != cudaSuccess) cudaGetLastError();
+            D.blocks = std::max(1, std::min(128, sms));
+        }
+        return true;
+    }
+    void ln_free(int di) {   // (a GPU whose lanes stay off: its slots back)
+        LaneDev& D = ln_dev[(size_t) di];
+        Dev& d = devs[(size_t) di];
+        if (D.vram == nullptr) return;
+        cudaSetDevice(d.id);
+        auto it = std::find(d.allocs.begin(), d.allocs.end(), (void*) D.vram);
+        if (it != d.allocs.end()) d.allocs.erase(it);
+        cudaFree(D.vram);
+        D.vram = nullptr;
+        D.on = false;
+    }
+    // a streamed expert's read (ln_pool's job j of ln_job): its RAM-tier copy or its file region read into its
+    // pinned slot a matrix at a time, each matrix's ready flag set as it lands - the device pulls the gate while the
+    // up and the down are read (bad: a read failed - the device leaves the pick out; every flag is set either way).
+    // No GPU call.
+    void lane_copy(int j) {
+        LaneJob& J = ln_job;
+        const Layer& l = *J.l;
+        const int i = J.slot[j], e = J.e[j];
+        uint8_t* stg = ln_host + (size_t) i * ln_stride;
+        const bool held = !l.ram.empty() && l.ram[(size_t) e] >= 0;
+        bool ok = !held || read_mx(l, e, stg);
+        for (int r = 0; r < 3; ++r) {
+            if (ok && !held)
+                ok = pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r),
+                                stg + l.lay.trellis[r]);
+            if (!ok && *(volatile unsigned*) &J.pull->bad[i] == 0u) {
+                J.bad.fetch_or(1u << i);
+                *(volatile unsigned*) &J.pull->bad[i] = 1u;
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile unsigned*) &J.pull->ready[i][r] = J.seq;
+        }
+        if (J.left.fetch_sub(1, std::memory_order_acq_rel) != 1 || ln_no_done.load()) return;
+        // the last read: until the device has pulled them all - it does soon (its fetch kernel waits for nothing
+        // else); not seen within 200 ms: never waited for again
+        const double t = now_ms();
+        for (int it = 0; *(volatile unsigned*) &J.pull->done != J.seq; ++it) {
+            if (now_ms() - t > 200.0) {
+                ln_no_done.store(true);
+                std::fprintf(stderr, "ds4: PCIe lane: the device's pull of streamed experts not seen by the host - "
+                                     "decode falls back to the CPU lane's timing\n");
+                return;
+            }
+            if (it < 64)
+                cpu_relax();
+            else
+                std::this_thread::yield();
+        }
+    }
+    pcie::Mats lane_mats(const Layer& l) const {   // the layer's matrices in its blob
+        pcie::Mats m;
+        for (int r = 0; r < 3; ++r) {
+            m.off[r] = l.lay.trellis[r];
+            m.bytes[r] = mx_part_bytes(l, r);
+        }
+        return m;
+    }
+    // n experts of layer l read into the pinned slots slot[q] <- expert ex[q] for pull P (seq)
+    void lane_go(const Layer& l, int di, int n, const int* slot, const int* ex, pcie::Pull* P, unsigned seq) {
+        LaneJob& J = ln_job;
+        J.l = &l;
+        J.n = n;
+        J.pull = P;
+        J.seq = seq;
+        for (int q = 0; q < n; ++q) J.slot[q] = slot[q], J.e[q] = ex[q];
+        J.bad.store(0);
+        J.left.store(n);
+        if (n > 0) ln_pool->start(n, ln_fn);
+    }
+    unsigned lane_wait() {
+        if (ln_job.n > 0) ln_pool->wait();
+        ln_job.n = 0;
+        return ln_job.bad.load();
+    }
+    // a pull's picks: src[i] for slot i (0: none), the read flags clear, then its seq (after a release fence);
+    // dst[i]: where pick i lands instead of its staging slot - a recent slot it then stays in
+    void lane_publish(pcie::Pull* P, unsigned seq, const LaneDev& D, unsigned mask,
+                      const unsigned long long* dst = nullptr) {
+        for (int i = 0; i < pcie::kSlots; ++i) {
+            const bool on = ((mask >> i) & 1u) != 0u;
+            P->src[i] = on ? (unsigned long long) (D.host_dev + (size_t) i * D.hstride) : 0ull;
+            for (int r = 0; r < 3; ++r) P->mat[i][r] = 0ull;
+            P->dst[i] = dst != nullptr ? dst[i] : 0ull;
+            P->bad[i] = 0u;
+        }
+        for (int e = 0; e < pcie::kPullEnt; ++e) P->ent[e] = (signed char) -1;
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile unsigned*) &P->seq = seq;
+    }
+    // (serve_lane) of a decode request's CPU-lane picks (expert, t * kPicks + i), the ones the stream lane takes:
+    // every pick up to the device's staging slots (the cost model that keeps the picks whose stream costs more than
+    // the CPU lane comes with the calibration; DS4_GS=1 streams them all).  Their reads start now; the request's
+    // pull is published always (the device's fetch kernel waits for it; none streamed: no src).  The batch before
+    // is done by now (the device pulled it before it routed this request): waited for, its failures said.
+    void lane_take(Layer& l, std::vector<std::pair<int, int>>& picks, unsigned seq, const int (*ids)[kPicks]) {
+        pcie::Pull* P = ln_pull + seq % kRing;
+        if (ln_job.n > 0) {
+            if (lane_wait() != 0) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "ds4: PCIe lane: reading a streamed expert failed - that token went without it\n");
+            }
+        }
+        const LaneDev& D = ln_dev[(size_t) l.dev];
+        int slot[kPicks], ex[kPicks], ns = 0;
+        unsigned long long dst[pcie::kSlots] = {};
+        if (!picks.empty()) {
+            std::vector<std::pair<int, int>> keep;
+            for (size_t j = 0; j < picks.size(); ++j) {
+                if (ns < D.slots && ns < kPicks) {
+                    slot[ns] = picks[j].second % kPicks;   // (T == 1: its pick index; the staging slot is the pick)
+                    ex[ns++] = picks[j].first;
+                } else
+                    keep.push_back(picks[j]);
+            }
+            picks.swap(keep);
+        }
+        unsigned mask = 0;
+        for (int q = 0; q < ns; ++q) {
+            mask |= 1u << slot[q];
+            dst[slot[q]] = land_dst(l, ex[q], slot[q], seq, ids);   // (a recent slot it stays in; 0: the staging slot)
+        }
+        lane_publish(P, seq, D, mask, dst);
+        ln_mask_of[seq % kRing] = mask;   // (the enqueue thread skips the fetch kernel when it sees the pull and 0 here)
+        if (ns > 0) lane_go(l, l.dev, ns, slot, ex, P, seq);
+    }
+    // (on where a layer has recent slots) a streamed expert's landing: the least recently used of its layer's recent
+    // slots that this request does not route to (its expert's table entry still points there until the window ends)
+    // and no fill or other landing holds - the device pulls the expert there instead of a staging slot, and the tick
+    // after the window maps it: the bytes the link carried stay in VRAM, no second copy.  0: none
+    unsigned long long land_dst(Layer& l, int e, int q, unsigned seq, const int (*ids)[kPicks]) {
+        if (l.rc_n == 0 || l.nm != 1) return 0ull;
+        int v = -1;
+        for (int i = 0; i < l.rc_n; ++i) {
+            if (l.rc_fill[(size_t) i] >= 0 || l.rc_land[(size_t) i] >= 0) continue;
+            const int old = l.rc_exp[(size_t) i];
+            bool used = false;
+            for (int j = 0; j < l.k_exp && !used && old >= 0; ++j) used = ids[0][j] == old;
+            if (used) continue;
+            if (old < 0) {
+                v = i;
+                break;
+            }
+            if (v < 0 || l.rc_stamp[(size_t) i] < l.rc_stamp[(size_t) v]) v = i;
+        }
+        if (v < 0) return 0ull;
+        l.rc_land[(size_t) v] = e;
+        l.rc_lseq[(size_t) v] = seq;
+        l.rc_lq[(size_t) v] = q;
+        return l.rc_pin[(size_t) v];
+    }
+    // a recent slot's expert out: the table entry is what leaves (the bytes are the file's, the RAM parts stay)
+    void rc_unmap(Layer& l, int e) {
+        l.slot[(size_t) e] = -1;
+        l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+        for (int r = 0; r < 3; ++r) l.vm[(size_t) e][(size_t) r] = x3::Mat{};
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            l.tab_pin[0] = 0ull;
+            cudaSetDevice(devs[(size_t) x.dev].id);
+            cudaMemcpyAsync(x.vram_tab + e, &l.tab_pin[0], 8, cudaMemcpyHostToDevice, devs[(size_t) x.dev].st);
+        }
+    }
+    // map recent slot i of layer l to expert e (its old expert goes out first), and write the table entry: the next
+    // window's routing takes it as a VRAM expert, no PCIe
+    void rc_map(Layer& l, int i, int e) {
+        const int old = l.rc_exp[(size_t) i];
+        if (old >= 0 && l.slot[(size_t) old] == l.rc_base + i) rc_unmap(l, old);
+        l.rc_exp[(size_t) i] = e;
+        l.rc_stamp[(size_t) i] = rc_clock.load(std::memory_order_relaxed);
+        l.slot[(size_t) e] = l.rc_base + i;
+        if (l.nm == 1) set_vm(l, e, l.rc_base + i);
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            l.tab_pin[0] = (unsigned long long) (x.vram_base + (size_t) (l.rc_base + i) * unit(x));
+            cudaSetDevice(devs[(size_t) x.dev].id);
+            cudaMemcpyAsync(x.vram_tab + e, &l.tab_pin[0], 8, cudaMemcpyHostToDevice, devs[(size_t) x.dev].st);
+        }
+    }
+    // (before the cache scan empties cpu_hits) the tick window a recent fill's rule reads
+    void rc_hist_tick() {
+        if (!lane_on || recent_n <= 0) return;
+        for (Layer& l : L) {
+            if (l.rc_n == 0) continue;
+            l.rc_hist.push_back(l.cpu_hits);
+            while ((int) l.rc_hist.size() > kRcWin) l.rc_hist.pop_front();
+        }
+    }
+    // the recent slots between windows: the landings the device pulled, the fills its cache threads copied, and the
+    // next fills - an expert the CPU lane used kRcNeed times in the last kRcWin ticks of its layer
+    void rc_look(int T) {
+        if (!lane_on || recent_n <= 0) return;
+        (void) T;
+        std::vector<RcDone> done;
+        {
+            std::lock_guard<std::mutex> lk(sw_mu);
+            done.swap(rc_ready);
+        }
+        for (const RcDone& d : done) {
+            if (rc_inflight > 0) --rc_inflight;
+            Layer& l = L[(size_t) d.layer];
+            if (d.slot < 0 || d.slot >= l.rc_n || l.rc_fill[(size_t) d.slot] != d.expert) continue;
+            l.rc_fill[(size_t) d.slot] = -1;
+            if (l.slot[(size_t) d.expert] >= 0) continue;   // (a swap brought it in meanwhile: the copy drops)
+            rc_map(l, d.slot, d.expert);
+        }
+        for (Layer& l : L) {
+            if (l.rc_n == 0) continue;
+            // the landings (rc_land): the slot's old expert out, the new in - once the device pulled the expert and
+            // its read did not fail
+            for (int i = 0; i < l.rc_n; ++i) {
+                const int e = l.rc_land[(size_t) i];
+                if (e < 0) continue;
+                const unsigned sq = l.rc_lseq[(size_t) i];
+                const pcie::Pull* P = ln_pull + sq % kRing;
+                if (*(volatile const unsigned*) &P->done != sq) continue;   // (its window still running: later)
+                l.rc_land[(size_t) i] = -1;
+                if (P->bad[l.rc_lq[(size_t) i]] != 0u || l.slot[(size_t) e] >= 0) continue;   // (failed / a swap won)
+                rc_map(l, i, e);
+            }
+            // a new fill: an expert of the layer's last ticks used kRcNeed times, an empty slot else the least
+            // recently used one; the copy rides the cache threads (Swap with rc_slot set)
+            int started = 0;
+            for (int hh = (int) l.rc_hist.size() - 1; started < kRcFills && rc_inflight < kMaxSwaps && hh >= 0; --hh) {
+              for (const int e : l.rc_hist[(size_t) hh]) {   // (latest tick first)
+                if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0) continue;
+                int uses = 0;
+                for (const std::vector<int>& hv : l.rc_hist) uses += (int) std::count(hv.begin(), hv.end(), e);
+                if (uses < kRcNeed) continue;
+                bool filling = false;
+                for (int i = 0; i < l.rc_n; ++i) filling = filling || l.rc_fill[(size_t) i] == e;
+                if (filling) continue;
+                int v = -1;   // an empty slot, else the least recently used one not filling or landing
+                for (int i = 0; i < l.rc_n && v < 0; ++i)
+                    if (l.rc_fill[(size_t) i] < 0 && l.rc_land[(size_t) i] < 0 && l.rc_exp[(size_t) i] < 0) v = i;
+                if (v < 0)
+                    for (int i = 0; i < l.rc_n; ++i)
+                        if (l.rc_fill[(size_t) i] < 0 && l.rc_land[(size_t) i] < 0 &&
+                            (v < 0 || l.rc_stamp[(size_t) i] < l.rc_stamp[(size_t) v]))
+                            v = i;
+                if (v < 0) break;
+                if (l.rc_exp[(size_t) v] >= 0) {   // (out: its table entry, before the next window)
+                    const int old = l.rc_exp[(size_t) v];
+                    if (l.slot[(size_t) old] == l.rc_base + v) rc_unmap(l, old);
+                    l.rc_exp[(size_t) v] = -1;
+                }
+                l.rc_fill[(size_t) v] = e;
+                ++rc_inflight;
+                Swap sw{l.il, e, -1, -1, v};
+                {
+                    std::lock_guard<std::mutex> lk(sw_mu);
+                    sw_queue.push_back(sw);
+                }
+                sw_cv.notify_all();
+                if (++started >= kRcFills) break;
+              }
+            }
+        }
+    }
+    // the lane's memory and its threads, once the VRAM slots are mapped: every MXFP4 layer of a streaming GPU whose
+    // experts are not all in VRAM streams; none: the CPU lane alone (the default path, unchanged)
+    void lane_setup_gpus() {
+        if (!lane_gs_on() || ln_dev.empty()) return;
+        ln_layer.assign(L.size(), -1);
+        bool any = false;
+        for (const Layer& l : L)
+            if (lane_layer_ok(l) && ln_dev[(size_t) l.dev].vram != nullptr && l.n_vram < l.n_exp) any = true;
+        if (!any) return;
+        std::string err;
+        if (!hmap(ln_host, (size_t) kPicks * ln_stride, err) || !hmap(ln_pull, (size_t) kRing, err)) {
+            std::fprintf(stderr, "ds4: PCIe lane off: %s\n", err.c_str());
+            for (size_t di = 0; di < ln_dev.size(); ++di) ln_free((int) di);
+            return;
+        }
+        for (size_t di = 0; di < ln_dev.size(); ++di) {
+            LaneDev& D = ln_dev[di];
+            if (D.vram == nullptr) continue;
+            void* hd = nullptr;
+            cudaSetDevice(devs[di].id);
+            if (cudaHostGetDevicePointer(&hd, ln_host, 0) != cudaSuccess || hd == nullptr) {
+                cudaGetLastError();
+                std::fprintf(stderr, "ds4: PCIe lane: CUDA%d cannot address the pinned slots - its CPU lane alone\n",
+                             devs[di].id);
+                ln_free((int) di);
+                continue;
+            }
+            D.host_dev = (uint8_t*) hd;
+            D.hstride = ln_stride;
+            D.on = true;
+        }
+        int nl = 0;
+        for (const Layer& l : L)
+            if (lane_layer_ok(l) && ln_dev[(size_t) l.dev].on && l.n_vram < l.n_exp) {
+                ln_layer[(size_t) l.il] = 0;
+                ++nl;
+            }
+        if (nl == 0) {
+            for (size_t di = 0; di < ln_dev.size(); ++di) ln_free((int) di);
+            return;
+        }
+        const char* rv = std::getenv("DS4_GS_THREADS");
+        const int readers = std::max(1, std::min(8, rv != nullptr ? std::atoi(rv) : 2));
+        ln_pool = std::make_unique<Pool>(readers, std::vector<int>{}, 2000);
+        ln_fn = [this](int j) { lane_copy(j); };
+        lane_on = true;
+        std::fprintf(stderr, "ds4: PCIe lane: DS4_GS on, %d reader(s), %d layer(s), %d slot(s) of %zu MiB, %d recent\n",
+                     readers, nl, ln_dev[0].slots, ln_stride >> 20, recent_n);
+    }
+
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
     void serve_lane() {
@@ -6539,7 +6998,10 @@ struct Model::Impl {
                                 st.ahead_cold_hit += (fl[e] >> 3) & 1;
                             }
                             picks.push_back({e, t * kPicks + i});
-                        }
+                        } else if (l.rc_n > 0 && l.slot[(size_t) e] >= l.rc_base &&
+                                   l.slot[(size_t) e] < l.rc_base + l.rc_n)   // (a recent slot: its last use now)
+                            l.rc_stamp[(size_t) (l.slot[(size_t) e] - l.rc_base)] =
+                                rc_clock.load(std::memory_order_relaxed);
                     }
                 }
                 if (fl != nullptr) {   // the guesses by rank: how many were picked
@@ -6553,6 +7015,9 @@ struct Model::Impl {
                     }
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                // the PCIe lane (a decoded token on a layer that streams): the picks it takes leave the CPU lane's,
+                // their reads start now (lane_take); every request of such a layer publishes its pull
+                if (T == 1 && lane_on && lane_class(li) >= 0) lane_take(l, picks, next, r.ids);
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -9092,6 +9557,21 @@ struct Model::Impl {
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 prof_mark(d, 3);
+                // the PCIe lane (a layer that streams): the experts the host reads for it pulled into this GPU's
+                // slots as they land, into the plan, their gate / up - all while the CPU lane computes - their
+                // down with the VRAM ones' below
+                const int lc = lead && nm == 1 && mx ? lane_class(l.il) : -1;
+                // (no streamed pick for this request: no fetch kernel, no second gate / up - the pull's own seq says
+                // the service thread has already chosen, and its mask says nothing streams; unpublished: enqueue,
+                // the kernel waits for it as always)
+                if (lc >= 0 && !(*(volatile const unsigned*) &ln_pull[slot].seq == sq && ln_mask_of[slot] == 0u)) {
+                    const LaneDev& LD = ln_dev[(size_t) l.dev];
+                    pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), true,
+                                       d.plan_ptr, LD.plan2, l.k_exp, LD.blocks, s);
+                    x3::MoeArgs m2 = ma;
+                    m2.plan_ptr = LD.plan2;
+                    gg::moe_gate_up(m2, d.x, d.xg, s);
+                }
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
