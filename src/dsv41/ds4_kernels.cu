@@ -1450,6 +1450,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             }
         }
         on_cpu = cpu;
+        if (req != nullptr) req->ncpu[t] = cpu;   // published with the window: the lane skips its own scan when 0
     }
     // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
     // 20 KB over PCIe, where most windows have none

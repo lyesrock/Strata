@@ -218,6 +218,7 @@ struct Req {
     unsigned seq;
     int T;
     int na[2];   // lookahead: ahead[t][0 .. na[0]) the next layer's likely picks, ahead[t][kAhead1 ..) +na[1] the one after's
+    int ncpu[kWin];   // token t: 1 the plan left a pick for the CPU lane, 0: the device computes every pick
     int ids[kWin][kPicks];
     float w[kWin][kPicks];
     int ahead[kWin][kAhead];

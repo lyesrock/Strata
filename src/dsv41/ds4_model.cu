@@ -679,6 +679,20 @@ struct Layer {
     uint8_t* ring_bak = nullptr;
     float *c_snap = nullptr, *c_rows = nullptr;
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
+    // the landing slots (DS4_STREAM=N, opt-in): N extra VRAM slots a layer; a decode guess of the lookahead that
+    // sits on the CPU lane gets its blob pulled into one while the layers in between run, and the slot's address
+    // goes into vram_tab (a write on the compute stream's far side: a route already planned reads 0 and the CPU
+    // lane answers as usual, one after reads the blob that landed before the entry).  l.slot stays -1: the swap
+    // machinery never sees them; heat swaps can promote an expert, and its landing slot frees then.
+    int land_base = -1, n_land = 0;             // (land_base: the first landing slot's index in n_slots)
+    unsigned long long* land_pin = nullptr;     // pinned [n_land]: the entry each landing writes
+    std::vector<int> land_exp_of;               // slot -> its expert, -1: free            (under land_mu)
+    std::vector<int> land_e;                    // expert -> its landing slot, -1: none   (under land_mu)
+    std::vector<unsigned> land_seq;             // slot -> the request seq its entry went in at (an LRU stamp)
+    std::vector<uint8_t> land_barrier;          // slot -> 1: wait on land_ev before writing it again (the pull alone)
+    std::vector<uint8_t> land_landed;           // slot -> 1: its bytes and table entry went in (the pull alone)
+    std::vector<unsigned long long> vtab_host;  // the device table's mirror (member 0), kept by every writer
+    cudaEvent_t land_ev = nullptr;              // recorded on the compute stream: its plans' readers are done
     std::vector<uint8_t> zc;                    // (the RAM store) expert -> 1: its store slot is GPU-visible, the device computes it over PCIe
     unsigned long long* zc_tab = nullptr;       // device [n_exp]: those slots' device addresses (0: none) - the decode token's zc_stage reads it
     std::vector<std::array<x3::Mat, 3>> vm;     // expert -> its gate, up, down as EXL3 views of its VRAM blob
@@ -1000,6 +1014,32 @@ struct Model::Impl {
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
     std::thread pf_th;
+    // the landing slots (DS4_STREAM=N, default 0: off, the decode stays exactly as it is): the experts the
+    // lookahead guessed two layers ahead and that sit on the CPU lane get their blob copied into one of N extra
+    // VRAM slots a layer while those two layers run (a lane pick reads ~10 MB from RAM and computes ~0.8 ms on
+    // the CPU; the GPU's tile for a VRAM expert costs a fraction of that, and the slot keeps the expert for the
+    // windows after).  DS4_STREAM=N slots a layer, N up to 32; needs a GGUF read in place and no RAM store.
+    static int land_slots() {
+        static const int n = std::getenv("DS4_STREAM") ? std::max(0, std::min(32, std::atoi(std::getenv("DS4_STREAM")))) : 0;
+        return n;
+    }
+    bool land_on = false;                    // set at place_experts: the slots exist and the pull thread runs
+    int land_n = 0;
+    struct LandJob {
+        int layer = 0, e = 0, slot = 0;
+        bool drop = false;                   // the slot's expert left (evicted): zero its entry and mark the slot
+    };
+    std::deque<LandJob> land_q;
+    std::mutex land_mu;
+    std::condition_variable land_cv;
+    std::thread land_th;
+    cudaStream_t land_st[8] = {};            // the pull stream a device
+    unsigned long long* land_zero = nullptr; // pinned: the 8-byte 0 an eviction writes into vram_tab
+    std::atomic<long long> land_pulls{0}, land_pulled{0};
+    static constexpr int kLandStage = 4;
+    uint8_t* land_stage[kLandStage] = {};      // pinned staging blobs (the pool: a busy stage drops one pull, the lane answers)
+    cudaEvent_t land_done[kLandStage] = {};    // a stage's copy is still running on the pull stream
+    size_t land_maxb = 0;
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
@@ -1263,6 +1303,8 @@ struct Model::Impl {
         }
         sw_cv.notify_all();
         ram_cv.notify_all();
+        land_cv.notify_all();
+        if (land_th.joinable()) land_th.join();
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
@@ -2808,6 +2850,15 @@ struct Model::Impl {
             }
             for (SwapBufs& B : sw_bufs) cache_ths.emplace_back([this, &B] { cache_loop(B); });
         }
+        if (land_on) {
+            land_th = std::thread([this] { land_loop(); });
+            {
+                double gb = 0.0;
+                for (const Layer& l : L) gb += (double) l.n_land * (double) unit(l);
+                std::fprintf(stderr, "ds4: landing slots: %d a layer, %.1f GB of VRAM pulled by the pull thread (DS4_STREAM)\n",
+                             land_n, gb / 1e9);
+            }
+        }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             CK(cudaStreamSynchronize(d.st));
@@ -3894,6 +3945,14 @@ struct Model::Impl {
     }
 
     bool place_experts(std::string& err) {
+        // the landing slots' budget comes off the experts' room before the shares are cut (they are experts' room
+        // too); off without a GGUF read in place, with the RAM store, or DS4_STREAM=0 (the default)
+        land_n = land_slots();
+        if (!file_experts || store_gb() > 0.0) land_n = 0;
+        land_on = land_n > 0;
+        if (land_slots() > 0)
+            std::fprintf(stderr, "ds4: DS4_STREAM=%d: file_experts=%d store=%.2f GB -> land %d\n",
+                         land_slots(), (int) file_experts, store_gb(), (int) land_on);
         // (Windows, an integrated GPU: what its experts may commit - commit_room - and what that kept off the GPU)
         double room = 1e300, kept = 0;
         for (const Dev& d : devs)
@@ -3942,6 +4001,13 @@ struct Model::Impl {
                     l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
                     budget_t -= (double) l.n_vram * ucount(l);
                 }
+            if (land_n > 0) {   // the landing slots a layer, paid for like experts of that layer (only nm == 1 takes them)
+                double landb = 0;
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp && !l.cpu_only && l.nm == 1) landb += (double) land_n * ucount(l);
+                budget = std::max(0.0, budget - landb);
+                budget_t = std::max(0.0, budget_t - landb);
+            }
             double want = 0;
             for (const Layer& l : L)
                 if (l.grp == (int) gi && !l.mtp && !l.cpu_only) want += (double) ucount(l) * l.n_exp;
@@ -4000,6 +4066,16 @@ struct Model::Impl {
             } else {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
+            }
+            if (land_n > 0 && !l.mtp && !l.cpu_only && l.nm == 1 && l.n_slots > 0 && l.n_slots < l.n_exp) {
+                l.land_base = l.n_slots;
+                l.n_land = land_n;
+                l.n_slots += l.n_land;   // (the cudaMalloc below takes the extra slots; the spare stays where it was)
+                l.land_exp_of.assign((size_t) l.n_land, -1);
+                l.land_e.assign((size_t) l.n_exp, -1);
+                l.land_seq.assign((size_t) l.n_land, 0);
+                l.land_barrier.assign((size_t) l.n_land, 0);
+                l.land_landed.assign((size_t) l.n_land, 0);
             }
             for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) i]] = i;
             for (int m = 0; m < l.nm && l.n_slots > 0; ++m) {
@@ -4078,6 +4154,7 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] >= 0) set_vm(l, e, l.slot[(size_t) e]);
             if (!halloc(l.tab_pin, (size_t) 2 * l.nm, err)) return false;
+            if (l.n_land > 0 && !halloc(l.land_pin, (size_t) l.n_land, err)) return false;
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
@@ -4086,7 +4163,42 @@ struct Model::Impl {
                         tab[(size_t) e] = (unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) e] * unit(x));
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
+                if (m == 0) l.vtab_host = tab;   // (the mirror every landing writer keeps)
             }
+            if (l.n_land > 0 && cudaEventCreateWithFlags(&l.land_ev, cudaEventDisableTiming) != cudaSuccess) {
+                err = "the landing slot event on CUDA" + std::to_string(devs[(size_t) l.dev].id);
+                return false;
+            }
+        }
+        if (land_on) {   // the pull's pinned staging pool and streams (a busy stage drops a pull, never a window)
+            for (const Layer& l : L)
+                if (l.n_land > 0) land_maxb = std::max(land_maxb, unit(l));
+            {
+                int nly = 0;
+                for (const Layer& l : L) nly += l.n_land > 0;
+                std::fprintf(stderr, "ds4: land pool: %d layers with slots, maxb %zu\n", nly, land_maxb);
+            }
+            if (land_maxb == 0) {
+                land_on = false;
+                return true;
+            }
+            if (!halloc(land_zero, 1, err)) return false;
+            *land_zero = 0ull;
+            for (int i = 0; i < kLandStage; ++i) {
+                if (cudaHostAlloc((void**) &land_stage[i], land_maxb, cudaHostAllocPortable) != cudaSuccess) {
+                    err = "the landing staging blob";
+                    return false;
+                }
+                if (cudaEventCreateWithFlags(&land_done[i], cudaEventDisableTiming) != cudaSuccess) {
+                    err = "the landing stage event";
+                    return false;
+                }
+            }
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (cudaStreamCreateWithFlags(&land_st[di], cudaStreamNonBlocking) != cudaSuccess) {
+                    err = "the landing pull stream on CUDA" + std::to_string(devs[di].id);
+                    return false;
+                }
         }
         return true;
     }
@@ -6317,6 +6429,22 @@ struct Model::Impl {
                 cudaMemcpyAsync(x.vram_tab + sw.in, &l.tab_pin[2 * m], 8, cudaMemcpyHostToDevice, dm.st);
                 cudaMemcpyAsync(x.vram_tab + sw.out, &l.tab_pin[2 * m + 1], 8, cudaMemcpyHostToDevice, dm.st);
             }
+            if (land_on && l.n_land > 0) {   // (the table's other writer keeps the mirror; `in` frees its landing slot,
+                std::lock_guard<std::mutex> lk(land_mu);   //  its bytes reusable only behind the plans afoot)
+                if (!l.vtab_host.empty()) {
+                    const Layer& x0 = member(l, 0);
+                    l.vtab_host[(size_t) sw.in] = (unsigned long long) (x0.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(x0));
+                    l.vtab_host[(size_t) sw.out] = 0ull;
+                }
+                const int ls = l.land_e[(size_t) sw.in];
+                if (ls >= 0) {   // (`in` had a landing slot: the pull marks its bytes dead (the swap entry covers them)
+                    l.land_e[(size_t) sw.in] = -1;
+                    l.land_exp_of[(size_t) ls] = -1;
+                    land_q.push_back(LandJob{(int) ((size_t) (&l - L.data())), sw.in, ls, true});
+                    ++land_pulls;
+                    land_cv.notify_one();
+                }
+            }
             l.swap_pending = false;
             --sw_inflight;
             ++st.swaps;
@@ -6411,12 +6539,130 @@ struct Model::Impl {
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
     std::vector<std::pair<const void*, size_t>> pf_want;
+    // the landing pull (its own thread): assemble the blob (its RAM copy when it has one, else the file's pages),
+    // copy it into the slot on the pull stream, and put the slot's address into the layer's table on the compute
+    // stream - ordered after everything already queued there: a routing already planned reads its old table (the
+    // CPU lane answers it as always), a later one finds the expert in VRAM.  The lane keeps answering every
+    // non-VRAM pick anyway, so a landing that comes too late for a window costs bytes, never correctness.
+    void land_loop() {
+        for (;;) {
+            LandJob j;
+            {
+                std::unique_lock<std::mutex> lk(land_mu);
+                land_cv.wait(lk, [&] { return quit.load(std::memory_order_relaxed) || !land_q.empty(); });
+                if (quit.load(std::memory_order_relaxed)) return;
+                j = land_q.front();
+                land_q.pop_front();
+            }
+            Layer& l = L[(size_t) j.layer];
+            if (l.n_land <= 0 || j.slot < 0 || j.slot >= l.n_land) continue;
+            cudaSetDevice(devs[(size_t) l.dev].id);
+            Dev& d = devs[(size_t) l.dev];
+            if (j.drop) {   // (the pull, not the lane, enqueues on the compute stream: a lane write mid-window would
+                bool zero_it = false;   //  spin the stream's waiting kernel against a launch queue that never frees)
+                {
+                    std::lock_guard<std::mutex> lk(land_mu);
+                    if (l.land_landed[(size_t) j.slot] && j.e >= 0 && j.e < l.n_exp && !l.vtab_host.empty() &&
+                        l.vtab_host[(size_t) j.e] == l.land_pin[(size_t) j.slot])
+                        zero_it = true;
+                }
+                if (zero_it && cudaMemcpyAsync(l.vram_tab + j.e, land_zero, 8, cudaMemcpyHostToDevice, d.st) != cudaSuccess)
+                    cudaGetLastError();
+                cudaEventRecord(l.land_ev, d.st);   // (the marker: every plan afoot has read the slot's bytes by now)
+                l.land_barrier[(size_t) j.slot] = 1;
+                l.land_landed[(size_t) j.slot] = 0;
+                if (zero_it) {
+                    std::lock_guard<std::mutex> lk(land_mu);
+                    if (!l.vtab_host.empty()) l.vtab_host[(size_t) j.e] = 0ull;
+                }
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(land_mu);
+                if (l.land_exp_of[(size_t) j.slot] != j.e) continue;
+            }
+            int q = -1;
+            for (int i = 0; i < kLandStage && q < 0; ++i)
+                if (land_done[i] == nullptr || cudaEventQuery(land_done[i]) == cudaSuccess) q = i;
+            const size_t ub = unit(l);
+            if (q < 0 || land_stage[q] == nullptr || ub > land_maxb || !read_mx(l, j.e, land_stage[q])) {
+                std::lock_guard<std::mutex> lk(land_mu);   // (no stage or no bytes: the lane answers, the reservation goes back)
+                if (l.land_exp_of[(size_t) j.slot] == j.e) {
+                    l.land_exp_of[(size_t) j.slot] = -1;
+                    l.land_e[(size_t) j.e] = -1;
+                }
+                continue;
+            }
+            const unsigned long long addr = (unsigned long long) (l.vram_base + (size_t) (l.land_base + j.slot) * ub);
+            l.land_pin[(size_t) j.slot] = addr;
+            if (l.land_barrier[(size_t) j.slot]) {   // (an evicted slot: wait behind the compute stream's marker - the plans
+                cudaStreamWaitEvent(land_st[(size_t) l.dev], l.land_ev, 0);   //  afoot read its bytes until that point)
+                l.land_barrier[(size_t) j.slot] = 0;
+            }
+            // (the table write may wait for a launch slot with the lane waiting on land_mu beside it: the pull takes
+            //  the lock only around the short checks, never around an enqueue, so it always drains)
+            const bool ok = cudaMemcpyAsync(l.vram_base + (size_t) (l.land_base + j.slot) * ub, land_stage[q], ub,
+                                            cudaMemcpyHostToDevice, land_st[(size_t) l.dev]) == cudaSuccess &&
+                            cudaMemcpyAsync(l.vram_tab + j.e, &l.land_pin[(size_t) j.slot], 8, cudaMemcpyHostToDevice, d.st) == cudaSuccess;
+            if (ok) {
+                l.land_landed[(size_t) j.slot] = 1;
+                if (land_done[q] != nullptr) cudaEventRecord(land_done[q], land_st[(size_t) l.dev]);
+                std::lock_guard<std::mutex> lk(land_mu);
+                if (!l.vtab_host.empty()) l.vtab_host[(size_t) j.e] = addr;
+                ++land_pulled;
+            } else {
+                cudaGetLastError();
+                std::lock_guard<std::mutex> lk(land_mu);
+                if (l.land_exp_of[(size_t) j.slot] == j.e) {
+                    l.land_exp_of[(size_t) j.slot] = -1;
+                    l.land_e[(size_t) j.e] = -1;
+                }
+            }
+        }
+    }
+
+    // reserve a landing slot for a lookahead guess (the lane thread): a free slot, else the LRU one whose last pick
+    // is two whole windows behind (the lane consumed that window's routings since: no plan afoot reads it any more).
+    // A reuse zeroes the old entry and records the layer's event on the compute stream: the pull waits behind it.
+    void land_reserve(Layer& l, int e, unsigned seq) {
+        if (l.n_land <= 0 || e < 0 || e >= l.n_exp || l.land_e[(size_t) e] >= 0 || l.slot[(size_t) e] >= 0) return;
+        std::lock_guard<std::mutex> lk(land_mu);
+        int s = -1;
+        for (int i = 0; i < l.n_land; ++i)
+            if (l.land_exp_of[(size_t) i] < 0) { s = i; break; }
+        if (s < 0) {
+            static const bool reuse = std::getenv("DS4_STREAM_REUSE") && std::atoi(std::getenv("DS4_STREAM_REUSE")) != 0;
+            unsigned oldest = 0xffffffffu;
+            for (int i = reuse ? 0 : l.n_land; i < l.n_land; ++i)   // (DS4_STREAM_REUSE=0: a landed slot stays landed - the slots become an extra VRAM cache of the decode's hot set)
+                if (seq > l.land_seq[(size_t) i] + 2u * (unsigned) g.nl && l.land_seq[(size_t) i] < oldest) {
+                    oldest = l.land_seq[(size_t) i];
+                    s = i;
+                }
+            if (s < 0) return;
+            const int gone = l.land_exp_of[(size_t) s];
+            l.land_e[(size_t) gone] = -1;
+            l.land_exp_of[(size_t) s] = -1;
+            // (the lane never touches the compute stream mid-window: the pull's queue zeros the old entry and marks
+            //  the slot; it also clears the mirror once the device entry is really written - the table write order
+            //  is what keeps a route from ever reading a slot that is being refilled)
+            land_q.push_back(LandJob{(int) ((size_t) (&l - L.data())), gone, s, true});
+            ++land_pulls;
+            land_cv.notify_one();
+        }
+        l.land_exp_of[(size_t) s] = e;
+        l.land_e[(size_t) e] = s;
+        l.land_seq[(size_t) s] = seq;
+        land_q.push_back(LandJob{(int) ((size_t) (&l - L.data())), e, s});
+        ++land_pulls;
+        land_cv.notify_one();
+    }
+
     void ahead_ask(int li, const Req& r, unsigned seq, int T) {
         pf_want.clear();
         for (int a = 1; a <= 2; ++a) {
             const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
             if (m <= 0 || j >= (int) L.size()) continue;
-            const Layer& n = L[(size_t) j];
+            Layer& n = L[(size_t) j];
             uint8_t* fl = ahead_fl.data() + (size_t) j * 1024;
             uint8_t* rk = ahead_rank.data() + (size_t) j * 1024;
             if (ahead_for[(size_t) j] != seq + (unsigned) a) {
@@ -6429,6 +6675,10 @@ struct Model::Impl {
                     const int e = r.ahead[t][(a - 1) * kAhead1 + i];
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
+                    // landing (DS4_STREAM): the guess is a top pick two layers out, it sits on the CPU lane, and the
+                    // two layers in between are its runway: pull the blob now, its slot lands in the table meanwhile
+                    if (land_on && n.n_land > 0 && n.slot[(size_t) e] < 0 && (a == 2 ? i < n.k_exp : i < 2))
+                        land_reserve(n, e, seq + (unsigned) a);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
@@ -6523,6 +6773,7 @@ struct Model::Impl {
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
                         if (l.slot[(size_t) e] < 0) {
+                            if (land_on && r.ncpu[t] == 0) continue;   // (landing: the route found every pick of this token in VRAM, the device computed them all)
                             l.cpu_hits.push_back(e);
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
