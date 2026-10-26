@@ -7252,7 +7252,8 @@ struct Model::Impl {
             ar.R = l.ratio;
             ar.kcap = g.ix_topk;
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
-                        na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+                        na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4,
+                        na > kAttnScratchT ? kAttnWmma : 0, &d.attn_scr);   // (a short last slab: the staged kernel)
             prof_mark(d, 9);
             Finish fo;
             fo.rd = g.rd;
