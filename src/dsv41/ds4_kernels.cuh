@@ -151,6 +151,8 @@ struct AttnScratch {
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
+// heads_per_block kAttnWmma marks a prompt chunk's queries: with DS4_ATTN_MMA=1 those go to the tensor cores (sm_80+)
+constexpr int kAttnWmma = 16;
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
