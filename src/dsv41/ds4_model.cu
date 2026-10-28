@@ -1090,14 +1090,26 @@ struct Model::Impl {
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
+    // (DS4_LANE_TOUCH="2" or "2:64": so many threads read the guessed experts that already sit in the RAM tier once a
+    // layer ahead, one cache line each, so the lane reads them from the last level cache when their layer arrives
+    // instead of from DRAM (Phase 0: waiting for the CPU lane is 46-50% of the token, its reads run at raw DRAM
+    // rate).  After the ':' the byte budget of one route request, MB (48 by default: an expert is 5-6 MB, the guesses
+    // a layer ahead are a handful of RAM-resident ones).  Unset: off, the path is exactly as before.  Moves bytes
+    // into caches only, never a result.)
+    int lane_touch = std::getenv("DS4_LANE_TOUCH") ? std::atoi(std::getenv("DS4_LANE_TOUCH")) : 0;
+    size_t lane_touch_bytes = 48u << 20;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
-                                       // 8 asked for (prefetch)
+                                       // 8 asked for (prefetch); 16 touched into the caches (DS4_LANE_TOUCH)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
     std::thread pf_th;
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
+    std::vector<std::thread> touch_th;
+    std::mutex tch_mu;
+    std::condition_variable tch_cv;
+    std::vector<std::pair<const void*, size_t>> tch_q;
     // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS, 1 by default - 4 measured no faster
     // on one V100 - more for a PC to try: each its staging buffers and
     // copy streams), switched between windows
@@ -1425,6 +1437,12 @@ struct Model::Impl {
         }
         pf_cv.notify_all();
         if (pf_th.joinable()) pf_th.join();
+        {
+            std::lock_guard<std::mutex> lk(tch_mu);
+        }
+        tch_cv.notify_all();
+        for (std::thread& t : touch_th)
+            if (t.joinable()) t.join();
         {
             std::lock_guard<std::mutex> lk(sw_mu);
         }
@@ -3083,6 +3101,13 @@ struct Model::Impl {
                 serve_lane();
             });
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
+            if (ahead_mode > 0 && lane_touch > 0) {
+                lane_touch = std::min(lane_touch, 4);
+                if (const char* t = std::getenv("DS4_LANE_TOUCH"); t != nullptr)
+                    if (const char* c = std::strchr(t, ':'); c != nullptr && c[1] != '\0')
+                        lane_touch_bytes = std::max((size_t) 4, (size_t) std::atoi(c + 1)) << 20;
+                for (int i = 0; i < lane_touch; ++i) touch_th.push_back(std::thread([this] { touch_loop(); }));
+            }
         }
         if (o.expert_cache) {
             size_t maxb = 0;
@@ -7146,6 +7171,28 @@ struct Model::Impl {
             b.clear();
         }
     }
+    // DS4_LANE_TOUCH: read the guessed RAM-tier experts one line each, now, so the lane finds them in the caches when
+    // their layer arrives.  A cold read of a resident range is what the lane would pay anyway - earlier, while the
+    // GPU works and DRAM is mostly free - and out of the lane's critical path.
+    void touch_loop() {
+        std::vector<std::pair<const void*, size_t>> b;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(tch_mu);
+                tch_cv.wait(lk, [&] { return quit.load(std::memory_order_relaxed) || !tch_q.empty(); });
+                if (quit.load(std::memory_order_relaxed)) return;
+                b.swap(tch_q);
+            }
+            uint64_t keep = 0;
+            for (const auto& rg : b) {
+                const uint64_t* p = (const uint64_t*) rg.first;
+                for (size_t q = 0; q * 64 < rg.second; ++q) keep += p[q * 8];
+            }
+            static volatile uint64_t sink;
+            sink = keep;
+            b.clear();
+        }
+    }
     // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
     static bool file_read(const Layer& l, int e) {
         return l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
@@ -7166,8 +7213,11 @@ struct Model::Impl {
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
     std::vector<std::pair<const void*, size_t>> pf_want;
+    std::vector<std::pair<const void*, size_t>> tch_want;
     void ahead_ask(int li, const Req& r, unsigned seq, int T) {
         pf_want.clear();
+        tch_want.clear();
+        size_t tbytes = 0;
         for (int a = 1; a <= 2; ++a) {
             const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
             if (m <= 0 || j >= (int) L.size()) continue;
@@ -7185,6 +7235,14 @@ struct Model::Impl {
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
+                    if (lane_touch > 0 && (fl[e] & 16) == 0 && tbytes < lane_touch_bytes &&
+                        !n.ram.empty() && n.ram[(size_t) e] >= 0) {
+                        fl[e] |= 16;
+                        for (int q = 0; q < 3; ++q) {
+                            tch_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                            tbytes += mx_part_bytes(n, q);
+                        }
+                    }
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
                     if (store) store->prefetch(j, e);
@@ -7193,12 +7251,20 @@ struct Model::Impl {
                     ++st.ahead_pf;
                 }
         }
-        if (pf_want.empty()) return;
-        {
-            std::lock_guard<std::mutex> lk(pf_mu);
-            pf_q.insert(pf_q.end(), pf_want.begin(), pf_want.end());
+        if (!pf_want.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(pf_mu);
+                pf_q.insert(pf_q.end(), pf_want.begin(), pf_want.end());
+            }
+            pf_cv.notify_one();
         }
-        pf_cv.notify_one();
+        if (!tch_want.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(tch_mu);
+                tch_q.insert(tch_q.end(), tch_want.begin(), tch_want.end());
+            }
+            tch_cv.notify_one();
+        }
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
