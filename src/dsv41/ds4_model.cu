@@ -7258,13 +7258,18 @@ struct Model::Impl {
             }
             pf_cv.notify_one();
         }
-        if (!tch_want.empty()) {
-            {
-                std::lock_guard<std::mutex> lk(tch_mu);
-                tch_q.insert(tch_q.end(), tch_want.begin(), tch_want.end());
-            }
-            tch_cv.notify_one();
+    }
+    // DS4_LANE_TOUCH: the guessed ranges queue only after the layer's CPU work is done, so the touches ride the GPU's
+    // time instead of stealing DRAM bandwidth from the lane's own critical path (measured: touching straight from
+    // ahead_ask cost 2-3 % - the two reads met on the same bus).
+    void flush_touch() {
+        if (tch_want.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(tch_mu);
+            tch_q.insert(tch_q.end(), tch_want.begin(), tch_want.end());
         }
+        tch_cv.notify_one();
+        tch_want.clear();
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
@@ -7426,6 +7431,7 @@ struct Model::Impl {
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
                 }
+                if (lane_touch > 0 && !ahead_for.empty()) flush_touch();
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
