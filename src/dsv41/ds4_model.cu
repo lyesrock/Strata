@@ -5096,6 +5096,21 @@ struct Model::Impl {
     // every node's cores (the pages lie where the cache put them)
     void make_pools() {
         std::vector<std::vector<int>> cs = cores;
+        // DS4_LANE_CORES="0-7,16-23/8-15,24-31": the pool core lists, one per '/', in pool order ("0-7,16-23" on one
+        // list: split between the pools like the NUMA test).  A CPU whose big L3 sits on one CCX (a 9950X3D: 96 MB on
+        // the first CCD, 32 on the second) reads the lane's experts at DRAM speed when its workers straddle both.
+        // Unset: the node's cores, unchanged.  Moves threads only, never a result.
+        if (const char* lc = std::getenv("DS4_LANE_CORES"); lc != nullptr && *lc != '\0') {
+            std::vector<std::vector<int>> ls;
+            for (size_t a = 0; lc[a] != '\0';) {
+                const size_t b = std::strcspn(lc + a, "/");
+                std::vector<int> v = cpu_list(std::string(lc + a, b));
+                if (!v.empty()) ls.push_back(std::move(v));
+                a += b;
+                if (lc[a] == '/') ++a;
+            }
+            if (!ls.empty()) cs = std::move(ls);
+        }
         if ((int) cs.size() < NH && !cs.empty()) {   // (DS4_COPY_NUMA=2 on one node, a test: its cores split in NH)
             std::vector<int> all = cs[0];
             cs.assign((size_t) NH, {});
