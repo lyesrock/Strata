@@ -24,7 +24,10 @@ namespace strata::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    // The widest window the policy prices. Up to 8 rows every build has always run; sizes 9..16 exist only in a
+    // wide-window build (kWindowMaxT = 16) - the long lookup windows of STRATA_LOOKUP, or a plain --batch wider
+    // than 8 slots - where they carry the kShape prior until they are measured.
+    static constexpr int kMaxT = 16;
     static constexpr int kBuckets = 4;
     static constexpr int kCtxBuckets = 3;   // STRATA_SPEC_COST: row costs per context length (< 6K, < 24K, longer)
 
