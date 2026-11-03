@@ -47,6 +47,7 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/group_gpu.hpp"   // STRATA_PF_GROUP_GPU: the streamed chunks' MoE grouping on the GPU
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -1033,6 +1034,11 @@ struct Prefill::Impl {
     void *Xq = nullptr, *Hq = nullptr;
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
+    // STRATA_PF_GROUP_GPU=1 (group_gpu.cu): the streamed chunk's routed ids counted, prefix-summed and scattered on
+    // the GPU; the host only downloads the expert counts (n_expert int32) to size its groups.  One cudaMalloc for all
+    // three, kept in `owned` (cnt [ne] | off [ne + 1, off[ne] = the sum] | fill [ne]).
+    int32_t *cnt_dev = nullptr, *off_dev = nullptr, *fill_dev = nullptr;
+    int nsm = 0;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     float *Xscale = nullptr, *Hscale = nullptr, *grp_tail = nullptr;   // NVFP4: activation scales, expert tails
     float* row_sd = nullptr;          // NVFP4 in MMQ: each Dm row's s_down, applied by the combine as it reads the row
@@ -4337,7 +4343,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
                         int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
-                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        // STRATA_PF_GROUP_GPU=1: the streamed chunk's grouping (count, offsets, slot/src) runs on this
+                        // stream now, and the sync below waits for it along with the attention and the router; only
+                        // the expert counts are downloaded afterwards.  The old path - 320 KB of ids down, one host
+                        // core sorting, 640 KB back up - measured 28.9% of prompt time on 2x Tesla P40 (2026-10-24
+                        // plan, measured 2026-11-02), the GPU idle through it.  The host grouping stays where any of
+                        // its extras live: a mapped table (the ids live in the table), the RAM policy's route seed,
+                        // an input dump, a peer, an APR/NVFP4/WMMA layer's own path, or a chunk too small to stream.
+                        static const bool pgg_env = [] {
+                            const char* v = std::getenv("STRATA_PF_GROUP_GPU");
+                            return v != nullptr && v[0] != '\0' && v[0] != '0';
+                        }();
+                        static const bool pgg_dump = std::getenv("STRATA_DUMP_MOE_INPUT") != nullptr;
+                        bool pgg = pgg_env && !pgg_dump && !grp_mapped && stream_all && use_mmq && !m.pp &&
+                                   on_routes == nullptr && !detail::mmq_resident_sort_requested() &&
+                                   m.ids != nullptr && m.slot_dev != nullptr &&
+                                   m.src_dev != nullptr && !mmq_plan().wmma_only[(size_t) l] && !lay.fmt.empty() &&
+                                   !lay.fmt[(size_t) l].tail_off && !lay.fmt[(size_t) l].had_gu;
+                        if (pgg && m.cnt_dev == nullptr) {   // the three device tables, once (kept in owned)
+                            int nsm = 0;
+                            if (cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, m.device) == cudaSuccess) {
+                                int32_t* p = nullptr;
+                                const int ne = (int) m.g->n_expert;
+                                if (cudaMalloc((void**) &p, (size_t) (3 * ne + 1) * sizeof(int32_t)) == cudaSuccess) {
+                                    m.owned.push_back(p);
+                                    m.cnt_dev = p; m.off_dev = p + ne; m.fill_dev = p + 2 * ne + 1; m.nsm = nsm;
+                                } else
+                                    cudaGetLastError();
+                            } else
+                                cudaGetLastError();
+                        }
+                        pgg = pgg && m.cnt_dev != nullptr;
+                        if (pgg) {
+                            if (!strata::prefill::gpu_group::group_on_gpu(m.ids, T * K, (int) K, (int) m.g->n_expert,
+                                                                         m.cnt_dev, m.off_dev, m.fill_dev, m.slot_dev,
+                                                                         m.src_dev, m.nsm, m.cs)) {
+                                err = "prefill: the on-device grouping failed";
+                                return false;
+                            }
+                        } else if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                         else if (m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
@@ -4456,11 +4500,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!shared_expert()) return false;
                             pt.mark(kPfHostGroup, cs);
                         }
+                        if (pgg) {
+                            // the counts the host grouping needs, from the device chain above (the scatter already
+                            // filled slot_dev/src_dev); off_dev's last entry is the sum, but the loop below reads the
+                            // counts, so check the sum here
+                            if (m.up_ring.d2h_sync(m.cnt.data(), m.cnt_dev, (size_t) m.g->n_expert * 4, m.cs) != cudaSuccess) {
+                                err = "prefill: the expert counts' download failed";
+                                return false;
+                            }
+                            int64_t tot = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) tot += m.cnt[(size_t) e];
+                            if (tot != T * K) { err = "prefill: routed id out of range"; return false; }
+                        } else {
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -4534,12 +4591,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.off[(size_t) m.g->n_expert] = r;
                             rows_local -= rows_cpu;
                         }
+                        if (!pgg) {
                         std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
                             const int32_t p = fill[(size_t) e]++;
                             slot_h[(size_t) i] = p;
                             src_h[(size_t) p] = (int32_t) (i / K);
+                        }
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
@@ -4564,7 +4623,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
                                                            detail::mmq_resident_sort_span(order.size(), MMQ_GROUP, sort_full));
-                        if (grp_mapped) {
+                        if (pgg) {   // the scatter above wrote them on the GPU already
+                        } else if (grp_mapped) {
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
                         } else {
