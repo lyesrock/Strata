@@ -11370,11 +11370,18 @@ int main(int argc, char** argv) {
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         // a layer split's hand-off buffers (and its pipelined windows) hold kVerifyMaxT rows: --lookup-max-t stops there
-        if (n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT) {
+        // (local patch, 2x P40: the long lookup windows ran clean on a 2-GPU split - 16-row windows, 200+ copy rounds -
+        // so on a single-conversation server we let them through; STRATA_SPLIT_LONG_LOOKUP=0 restores the upstream clamp)
+        const bool split_long_ok = n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT &&
+                                   o.lookup_max_t > 0 && o.batch <= 1 && o.pipeline_windows == 0 &&
+                                   [] { const char* v = std::getenv("STRATA_SPLIT_LONG_LOOKUP"); return v == nullptr || v[0] != '0'; }();
+        if (n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT && !split_long_ok) {
             std::fprintf(stderr, "strata serve: --lookup-max-t %d: a layer split's windows stop at %d tokens\n",
                          o.lookup_max_t, strata::kernels::kVerifyNarrowT);
             o.spec = strata::kernels::kVerifyNarrowT;
-        }
+        } else if (split_long_ok)
+            std::fprintf(stderr, "strata serve: --lookup-max-t %d: long lookup windows ON over the layer split "
+                                 "(local patch; STRATA_SPLIT_LONG_LOOKUP=0 restores the upstream limit)\n", o.lookup_max_t);
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
